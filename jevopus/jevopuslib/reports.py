@@ -13,9 +13,20 @@ def cmd_status(a):
         cd = f" until {time.strftime('%H:%M', time.localtime(s['cooldown_until']))}" if s["cooldown_until"] else ""
         print(f"  {s['id']:14} {s['cli']:6} en={s['enabled']} {s['status']:8}{cd} {s['auth']:12} models={s['models']}  {s['note'] or ''}")
     print("JOBS")
-    for j in c.execute("SELECT * FROM jobs ORDER BY created_at"):
-        print(f"  {j['id']} {j['status']:12} {j['route'] or '-'}/{j['model'] or j['tier'] or '-'} seat={j['seat_id'] or '-'} "
+    from .limits import fmt_t
+    for j in c.execute("SELECT * FROM jobs WHERE chain_id IS NULL ORDER BY created_at"):
+        print(f"  {j['id']} {j['status']:13} {j['route'] or '-'}/{j['model'] or j['tier'] or '-'} seat={j['seat_id'] or '-'} "
               f":: {j['goal'][:60]!r}")
+        if j["chain"]:
+            print(f"      CHAIN: {j['chain_note'] or '-'}")
+            for k in c.execute("SELECT * FROM jobs WHERE chain_id=? ORDER BY created_at", (j["id"],)):
+                print(f"      {k['chain_step']:6} {k['status']:13} {k['model'] or '-'} seat={k['seat_id'] or '-'}"
+                      + (f"  moved: {json.loads(k['moves'])[-1]['from_seat']} -> {json.loads(k['moves'])[-1]['to_seat']}" if k["moves"] else "")
+                      + (f"  WAITING (limit) until ~{fmt_t(k['wait_until'])}" if k["status"] == "waiting_limit" else ""))
+        if j["status"] == "waiting_limit" and not j["chain"]:
+            print(f"      WAITING (limit): retries automatically after ~{fmt_t(j['wait_until'])} ({j['wait_source'] or '?'})")
+        if j["moves"] and not j["chain"]:
+            for mv in json.loads(j["moves"]): print(f"      LIMIT FALLBACK: {mv['from_seat']} ({mv['from_model']}) -> {mv['to_seat']} ({mv['to_model']})")
         if j["status"] == "needs_model" and j["model_issue"]:
             try: d = json.loads(j["model_issue"])
             except Exception: d = {}
@@ -25,6 +36,8 @@ def cmd_status(a):
                   + f"jevopus.py cancel {j['id']}")
     from . import limits
     print("LIMITS  " + limits.short_line(c, config()) + "   (details: jevopus.py limits)")
+    n = c.execute("SELECT COUNT(*) FROM jobs WHERE limit_notice IS NOT NULL AND notice_sent=0").fetchone()[0]
+    if n: print(f"NOTICES {n} undelivered limit notice(s): jevopus.py notices")
 
 
 def _since(spec):
@@ -42,6 +55,14 @@ def cmd_report(a):
     print(f"goal: {j['goal']}")
     if j["cached_from"]: print(f"cache: reused result of {j['cached_from']} (not rerun)")
     if j["parent_id"]: print(f"best-of-two: candidate {j['bo2_role']} of {j['parent_id']} (see jevopus.py report {j['parent_id']})")
+    if j["chain_id"]: print(f"chain: step {j['chain_step']} of {j['chain_id']} (see jevopus.py report {j['chain_id']})")
+    from .limits import fmt_t
+    if j["status"] == "waiting_limit":
+        print(f"WAITING (limit): retries automatically after ~{fmt_t(j['wait_until'])} (source: {j['wait_source'] or '?'})"
+              + (f"\n  notice: {j['limit_notice']}" if j["limit_notice"] else ""))
+    for mv in json.loads(j["moves"] or "[]"):
+        print(f"LIMIT FALLBACK {mv['ts']}: {mv['from_seat']} ({mv['from_model']}) -> {mv['to_seat']} ({mv['to_model']}); why: {mv['why']}")
+    if j["chain"]: _chain_block(c, j)
     if j["route"] == "best_of_two" or j["best_of_two"]:
         kids = c.execute("SELECT * FROM jobs WHERE parent_id=? ORDER BY bo2_role", (j["id"],)).fetchall()
         if kids:
@@ -87,6 +108,27 @@ def cmd_report(a):
     logs = sorted(str(p) for p in [*jdir.glob("worker*.log"), *jdir.glob("[ab]/worker*.log")])
     print(f"logs: {', '.join(logs) or '-'}\nresult.json: {rp}")
     if j["prompt"]: print("---- exact prompt sent ----\n" + j["prompt"])
+
+
+def _chain_block(c, j):
+    ks = c.execute("SELECT * FROM jobs WHERE chain_id=? ORDER BY created_at", (j["id"],)).fetchall()
+    print(f"CHAIN (plan -> build -> review): {j['chain_note'] or '-'}")
+    for k in ks:
+        print(f"  {k['chain_step']:6} {k['id']}  model={k['model'] or '-'} ({k['model_source'] or '-'})  seat={k['seat_id'] or '-'}  "
+              f"status={k['status']}  verify={k['verify_status'] or '-'}  tokens={k['tokens'] or 0:,}  "
+              f"time={k['secs'] if k['secs'] is not None else '-'}s")
+    print(f"  total tokens (all steps): {sum(k['tokens'] or 0 for k in ks):,}   summary: {JOBS / j['id'] / 'chain.json'}")
+    for k in ks:
+        print(f"---- step {k['chain_step']} ({k['id']}) ----")
+        for mv in json.loads(k["moves"] or "[]"):
+            print(f"LIMIT FALLBACK: {mv['from_seat']} -> {mv['to_seat']} ({mv['to_model']}); why: {mv['why']}")
+        if k["status"] == "waiting_limit": print(f"WAITING (limit): {k['limit_notice'] or ''}")
+        try: r = json.loads(Path(k["result_path"]).read_text()); print(f"output: {r.get('status')} - {r.get('summary')}")
+        except Exception: print("output: (none yet)")
+        kd = job_dir(k); logs = sorted(str(p) for p in kd.glob("worker*.log"))
+        print(f"logs: {', '.join(logs) or '-'}")
+        print("exact prompt sent:\n" + (k["prompt"] or "(not sent yet)"))
+    print("---- end of chain steps ----")
 
 
 def cmd_usage(a):

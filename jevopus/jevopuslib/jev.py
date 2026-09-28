@@ -149,3 +149,19 @@ def ask_compare(pb, state):
     with _client(pb) as c:
         r = c.system_one(state=state, questions=q)
     return r.choices["better"].choice, round(float(r.choices["better"].confidence), 3)
+
+
+# ---------- task chains ----------
+def ask_chain(pb, job, pool):
+    """Per-step model advice for a plan -> build -> review chain. pool: {model: fit} on the connected seats.
+    -> {step: (model, confidence)}; Jevopus applies a pick only at >= min_choice_confidence."""
+    from typesafe_sdk import Choice
+    state = {"task": {"goal": job["goal"][:1500], "constraints": job["constraints"] or "", "done_when": job["done_when"] or ""},
+             "models": pool,
+             "note": "The task runs as three worker steps: plan (write plan.md), build (make the deliverable from the plan), "
+                     "review (check the build against the task, fix small issues). Each step can use a different model."}
+    q = {s: Choice(instructions=f"Which model in `models` fits the {s.upper()} step of `task` best?", criteria=dict(pool))
+         for s in ("plan", "build", "review")}
+    with _client(pb) as c:
+        r = c.system_one(state=state, questions=q)
+    return {s: (r.choices[s].choice, round(float(r.choices[s].confidence), 3)) for s in q}

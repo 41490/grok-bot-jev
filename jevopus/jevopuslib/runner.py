@@ -1,7 +1,7 @@
 """submit / route / tick / run (+ Jev verification and fix rounds) / confirm."""
 import json, os, re, shutil, subprocess, sys, time, uuid
 from pathlib import Path
-from . import evidence as ev_mod, jev, limits as lim, models as mdl
+from . import evidence as ev_mod, jev, limitfb, limits as lim, models as mdl
 from .core import (JOBS, RECIPES, HOME, LIMIT_RE, band, cli_model, config, db, enabled_models, env, err_sig, goal_hash, iso, job_dir,
                    log, now, playbook, record_decisions, refresh_seats, seat_event, worker_env)
 
@@ -51,7 +51,8 @@ def check_tools(tools):
 def cmd_submit(a):
     c = db(); cfg = config()
     recipe, vars_, cli_cfg, attach, search = None, None, [], [], int(bool(getattr(a, "search", False)))
-    bo2 = bool(getattr(a, "best_of_two", False)) or bool(cfg["best_of_two"].get("all_jobs"))
+    chain = int(bool(getattr(a, "chain", False)))
+    bo2 = (bool(getattr(a, "best_of_two", False)) or bool(cfg["best_of_two"].get("all_jobs"))) and not chain
     goal, constraints, done_when, kind, model, effort = a.goal, a.constraints, a.done_when, a.kind, a.model, a.effort
     if a.recipe:
         r = load_recipe(a.recipe); recipe = r["name"]
@@ -79,12 +80,21 @@ def cmd_submit(a):
                   + (f" (did you mean: {', '.join(rs['suggestions'])})" if rs["suggestions"] else ""), file=sys.stderr)
     jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     c.execute("INSERT INTO jobs(id,goal,constraints,done_when,kind,status,created_at,model,effort,pin_seat,model_source,"
-              "goal_hash,confirmed,from_agent,recipe,recipe_vars,forced,cli_config,attach,best_of_two,search,requested_model) "
-              "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              "goal_hash,confirmed,from_agent,recipe,recipe_vars,forced,cli_config,attach,best_of_two,search,requested_model,chain) "
+              "VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
               (jid, goal, constraints, done_when, kind, iso(), model or None, effort or None, a.seat or None,
                "pinned" if model else None, goal_hash(goal), int(a.confirmed), a.from_agent or None, recipe,
-               json.dumps(vars_) if vars_ else None, int(a.force), json.dumps(cli_cfg), json.dumps(attach), int(bo2), search, requested))
-    c.commit(); (JOBS / jid).mkdir(parents=True, exist_ok=True); print(jid)
+               json.dumps(vars_) if vars_ else None, int(a.force), json.dumps(cli_cfg), json.dumps(attach), int(bo2), search, requested,
+               chain))
+    for step in ("plan", "build", "review"):  # chain: per-step owner model pins (--plan-model etc.)
+        v = getattr(a, f"{step}_model", "") or ""
+        if v:
+            rs = mdl.resolve(cfg, v)
+            if not rs["model"]: sys.exit(f"--{step}-model: '{v}' is not a known model (see jevopus.py models)")
+            c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (f"chain_pin:{jid}:{step}", rs["model"]))
+    c.commit(); (JOBS / jid).mkdir(parents=True, exist_ok=True)
+    if not getattr(a, "quiet", False): print(jid)
+    return jid
 
 
 def cmd_repin(a):
@@ -108,7 +118,7 @@ def cmd_repin(a):
             sys.exit(f"'{want}' is not a known model" + (f"; did you mean: {', '.join(rs['suggestions'])}" if rs["suggestions"] else "")
                      + " (see jevopus.py models)")
         model, src = rs["model"], "pinned"
-    c.execute("DELETE FROM jobs WHERE parent_id=? AND status IN ('queued','blocked')", (j["id"],))
+    c.execute("DELETE FROM jobs WHERE (parent_id=? OR chain_id=?) AND status IN ('queued','blocked')", (j["id"], j["id"]))
     c.execute("UPDATE jobs SET model=?, model_source=?, requested_model=?, model_issue=NULL, status='queued', route=NULL "
               "WHERE id=?", (model, src, want if model else None, j["id"])); c.commit()
     log({"event": "repin", "job_id": j["id"], "model": model or "auto"})
@@ -117,14 +127,16 @@ def cmd_repin(a):
 
 
 def cmd_confirm(a):
-    c = db(); c.execute("UPDATE jobs SET confirmed=1 WHERE id=? OR parent_id=?", (a.job_id, a.job_id)); c.commit()
+    c = db(); c.execute("UPDATE jobs SET confirmed=1 WHERE id=? OR parent_id=? OR chain_id=?", (a.job_id, a.job_id, a.job_id)); c.commit()
     log({"event": "confirm", "job_id": a.job_id}); print(f"{a.job_id}: confirmed by human")
 
 
 def cmd_cancel(a):
     c = db(); j = c.execute("SELECT * FROM jobs WHERE id=?", (a.job_id,)).fetchone()
-    if not j or j["status"] not in ("queued", "leased", "needs_model"): sys.exit(f"only queued/leased/needs_model jobs can be cancelled")
-    for k in [j, *c.execute("SELECT * FROM jobs WHERE parent_id=? AND status IN ('queued','leased','needs_model')", (a.job_id,)).fetchall()]:
+    ok = ("queued", "leased", "needs_model", "waiting_limit") + (("running",) if j and j["chain"] else ())
+    if not j or j["status"] not in ok: sys.exit("only queued/leased/needs_model/waiting_limit jobs (or a running chain) can be cancelled")
+    for k in [j, *c.execute("SELECT * FROM jobs WHERE (parent_id=? OR chain_id=?) AND status IN ('queued','leased','needs_model','waiting_limit')",
+                            (a.job_id, a.job_id)).fetchall()]:
         if k["status"] == "leased": c.execute("UPDATE seats SET status='idle' WHERE id=?", (k["seat_id"],))
         c.execute("UPDATE jobs SET status='blocked', route_note=COALESCE(route_note,'')||'; cancelled by user', lease_until=NULL "
                   "WHERE id=?", (k["id"],))
@@ -134,7 +146,7 @@ def cmd_cancel(a):
 # ---------- route ----------
 def _fail_info(c, job, pb):
     rows = c.execute("SELECT id, err_sig, result_path FROM jobs WHERE goal_hash=? AND id!=? AND status IN "
-                     "('failed','needs_review') AND err_sig IS NOT NULL AND parent_id IS NULL ORDER BY created_at DESC",
+                     "('failed','needs_review') AND err_sig IS NOT NULL AND parent_id IS NULL AND chain_id IS NULL ORDER BY created_at DESC",
                      (job["goal_hash"], job["id"])).fetchall()
     if not rows: return None
     n = 0
@@ -151,13 +163,16 @@ def cmd_route(a):
     c = db(); cfg, pb = config(), playbook()
     job = c.execute("SELECT * FROM jobs WHERE id=?", (a.job_id,)).fetchone()
     if not job: sys.exit(f"no job {a.job_id}")
+    if job["chain"]:
+        from . import chain
+        return chain.route_chain(c, job)
     pol, th, t0 = pb["policy"], pb["thresholds"], now()
     avail = enabled_models(c, cfg)
     models = {m: cfg["models"][m]["fit"] for m in avail if m in cfg["models"]}
     if job["pin_seat"]:
         models = {m: f for m, f in models.items() if job["pin_seat"] in avail[m]}
     recent = [] if job["forced"] else [(r["id"], r["goal"]) for r in c.execute(
-        "SELECT id, goal FROM jobs WHERE status='done' AND id!=? AND result_path IS NOT NULL AND parent_id IS NULL "
+        "SELECT id, goal FROM jobs WHERE status='done' AND id!=? AND result_path IS NOT NULL AND parent_id IS NULL AND chain_id IS NULL AND chain=0 "
         "AND (verify_status IS NULL OR verify_status='pass') ORDER BY created_at DESC LIMIT ?",
         (job["id"], int(cfg["reuse"]["candidates"])))]
     fail = _fail_info(c, job, pb)
@@ -263,6 +278,11 @@ def lease(c, job, cfg, quiet=False):
     say = (lambda m: None) if quiet else print
     if job["requires_confirm"] and not job["confirmed"]:
         say(f"{job['id']}: waiting for human confirmation (jevopus.py confirm {job['parent_id'] or job['id']})"); return None
+    pf = limitfb.preflight(c, cfg, job)  # all seats for this model at their usage limit -> move or wait
+    if pf == "waiting":
+        say(f"{job['id']}: waiting_limit - {c.execute('SELECT limit_notice FROM jobs WHERE id=?', (job['id'],)).fetchone()[0]}"); return None
+    if pf == "moved":
+        job = c.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone(); say(f"{job['id']}: moved to {job['model']} (seat at its limit)")
     q = "SELECT * FROM seats WHERE enabled=1 AND status='idle' AND (cooldown_until IS NULL OR cooldown_until<?)"
     seats = c.execute(q, (now(),)).fetchall()
     if job["pin_seat"]: seats = [s for s in seats if s["id"] == job["pin_seat"]]  # never another login
@@ -290,16 +310,22 @@ def lease(c, job, cfg, quiet=False):
 
 def cmd_tick(a):
     c = db(); cfg = config(); refresh_seats(c); lim.refresh(c); n = 0
+    limitfb.requeue_due(c)
     for job in c.execute("SELECT * FROM jobs WHERE status='needs_model' AND model_issue IS NOT NULL").fetchall():
         try: iss = json.loads(job["model_issue"])
         except Exception: continue
         if iss.get("case") in ("cooldown", "over_limit") and mdl.availability(c, cfg, job["model"], job["pin_seat"], lim.is_large(job, cfg))["available"]:
+            if job["chain"]:
+                from . import chain
+                print(f"{job['id']}: {job['model']} is available again -> re-routing chain"); chain.route_chain(c, job, quiet=True); continue
             c.execute("UPDATE jobs SET status='queued', model_issue=NULL, route_note=COALESCE(route_note,'')||'; model available again' "
                       "WHERE id=?", (job["id"],)); c.commit(); print(f"{job['id']}: {job['model']} is available again -> queued")
-    for job in c.execute("SELECT * FROM jobs WHERE status='queued' AND route='farm' ORDER BY created_at").fetchall():
+    for job in c.execute("SELECT * FROM jobs WHERE status='queued' AND route='farm' AND chain_id IS NULL ORDER BY created_at").fetchall():
         n += bool(lease(c, c.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone(), cfg))
     for p in c.execute("SELECT id FROM jobs WHERE status='queued' AND route='best_of_two'").fetchall():
         print(f"{p['id']}: best-of-two parent (candidates {p['id']}-a / {p['id']}-b); run it with: jevopus.py run {p['id']}")
+    for p in c.execute("SELECT id FROM jobs WHERE chain=1 AND route='chain' AND status IN ('queued','running')").fetchall():
+        print(f"{p['id']}: chain (plan -> build -> review); run it with: jevopus.py run {p['id']}")
     print(f"tick: {n} lease(s)")
 
 
@@ -369,6 +395,9 @@ def cmd_run(a):
     if job and job["route"] == "best_of_two":
         from . import bestof2
         return bestof2.run_parent(c, job)
+    if job and job["chain"]:
+        from . import chain
+        return chain.run_parent(c, job)
     if not job or job["status"] != "leased": sys.exit(f"job {a.job_id} is not leased (status={job and job['status']})")
     if job["requires_confirm"] and not job["confirmed"]: sys.exit("job requires human confirmation first")
     seat = c.execute("SELECT * FROM seats WHERE id=?", (job["seat_id"],)).fetchone()
@@ -387,10 +416,7 @@ def cmd_run(a):
     res = _read_result(jdir)
     limited = rc != 0 and res.get("status") != "done" and bool(LIMIT_RE.search(out))
     vstatus, vp, rounds, vused = None, None, 0, False
-    if limited:
-        c.execute("UPDATE seats SET status='cooldown', cooldown_until=? WHERE id=?", (now() + cfg["cooldown_sec"], seat["id"]))
-        seat_event(c, seat["id"], "cooldown", job["id"], "rate/quota limit"); vstatus = "skipped"
-    else:
+    if not limited:
         while True:
             vp, vused, res = verify(pb, job, jdir, out)
             ok = vp >= float(cfg["verify"]["pass_min"])
@@ -406,11 +432,11 @@ def cmd_run(a):
             out2, rc = _exec(_argv(seat, cli_model(cfg, model), job["effort"], fix, cli_cfg, session=sid, search=search), jdir, wenv, timeout)
             (jdir / f"worker_fix{rounds}.log").write_text(out2); t2, _ = parse_usage(out2); tokens += t2
             log({"event": "run_fix", "job_id": job["id"], "seat": seat["id"], "model": model, "session": sid, "rc": rc, "round": rounds})
-            if rc != 0 and LIMIT_RE.search(out2):
-                c.execute("UPDATE seats SET status='cooldown', cooldown_until=? WHERE id=?", (now() + cfg["cooldown_sec"], seat["id"]))
-                seat_event(c, seat["id"], "cooldown", job["id"], "limit during fix"); limited = True; vstatus = "fail"; break
             out = out + "\n" + out2
+            if rc != 0 and LIMIT_RE.search(out2): limited = True; break
         if not limited: c.execute("UPDATE seats SET status='idle' WHERE id=?", (seat["id"],))
+    if limited:
+        return _on_limit(c, cfg, job, seat, jdir, out, tokens, int(now() - t0), rc, a)
     rp = jdir / "result.json"
     if not rp.exists():
         rp.write_text(json.dumps({"status": "failed", "summary": f"worker exited rc={rc} without result.json"
@@ -420,7 +446,7 @@ def cmd_run(a):
     status = "done" if vstatus == "pass" else ("needs_review" if vstatus == "fail" and not limited else "failed")
     esig = None if status == "done" else err_sig((res.get("summary") or "") + " ".join(res.get("open_issues") or []))
     secs = int(now() - t0)
-    c.execute("UPDATE jobs SET status=?, result_path=?, lease_until=NULL, tokens=?, secs=?, finished_at=?, session_id=?, "
+    c.execute("UPDATE jobs SET status=?, result_path=?, lease_until=NULL, tokens=COALESCE(tokens,0)+?, secs=?, finished_at=?, session_id=?, "
               "verify_p=?, verify_status=?, fix_rounds=?, err_sig=? WHERE id=?",
               (status, str(rp), tokens, secs, iso(), sid, vp, vstatus, rounds, esig, job["id"]))
     seat_event(c, seat["id"], "job_" + status, job["id"]); c.commit()
@@ -431,3 +457,23 @@ def cmd_run(a):
     if job["parent_id"]:
         from . import bestof2
         bestof2.maybe_finish(c, job["parent_id"])
+
+
+def _on_limit(c, cfg, job, seat, jdir, out, tokens, secs, rc, a):
+    """The seat hit a usage/rate limit: move the job to another connected seat (not owner-pinned) or wait for the reset."""
+    tag = f"{seat['id']}-{int(now())}"
+    for f in list(jdir.glob("worker*.log")):  # keep the limited attempt's logs; the retry starts clean
+        if "_limited_" not in f.name: f.rename(jdir / f"{f.stem}_limited_{tag}{f.suffix}")
+    (jdir / "result.json").unlink(missing_ok=True)
+    lim.after_run(c, seat, out)  # provider data first: it may carry the reset time
+    c.execute("UPDATE jobs SET tokens=COALESCE(tokens,0)+?, session_id=NULL WHERE id=?", (tokens, job["id"])); c.commit()
+    act = limitfb.handle_limit(c, cfg, job, seat, out)
+    log({"event": "run", "job_id": job["id"], "seat": seat["id"], "model": job["model"], "rc": rc, "status": act["action"],
+         "limited": True, "tokens": tokens, "secs": secs})
+    print(act["line"], flush=True)
+    if act["action"] == "waiting":
+        print(f"(one-line notice for the owner is queued: jevopus.py notices)")
+        return act
+    j2 = c.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+    if getattr(a, "no_follow", False) or not lease(c, j2, cfg): return act
+    return cmd_run(type("A", (), {"job_id": job["id"]})())

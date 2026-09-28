@@ -22,7 +22,9 @@ RECIPES = HOME / "recipes"
 CONFIG = HOME / "config.json"
 RENDER_PY = HOME / "tools" / "render-venv" / "bin" / "python"
 SECRET_ENV_RE = re.compile(r"(API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.I)
-LIMIT_RE = re.compile(r"rate.?limit|quota|usage limit|too many requests|\b429\b|insufficient_quota|limit reached", re.I)
+LIMIT_RE = re.compile(r"rate.?limit|quota|usage limit|too many requests|\b429\b|insufficient_quota|limit reached|"
+                      r"hit your (usage |rate |weekly |5.hour )?limit|(5.hour|weekly|daily) limit|out of (credits|messages)|"
+                      r"rate_limit_error|usage_limit_reached", re.I)
 
 
 def jev_dir():
@@ -61,6 +63,15 @@ DEFAULT_CONFIG = {
     "run_timeout_sec": 1800,
     "best_of_two": {"all_jobs": False, "recipes": [],
                     "_note": "Run two models and keep the better verified result. Also: submit --best-of-two, or recipe \"best_of_two\": true."},
+    "limit_fallback": {"enabled": True,
+                       "_note": "On a subscription/rate limit: move a job the owner did not pin to another connected seat; "
+                                "otherwise the job waits (status waiting_limit) and is retried after the reset."},
+    "chain": {"plan": "claude", "build": "codex", "review": "claude",
+              "models": {"claude": {"plan": "opus", "build": "sonnet", "review": "opus"},
+                         "codex": {"plan": "gpt-6-sol", "build": "gpt-6-sol", "review": "gpt-6-sol"}},
+              "_note": "plan/build/review = provider per step when both Claude Code and Codex are connected; models = "
+                       "model per provider and step. With one subscription every step runs on that seat."},
+    "suggest": {"decline_days": 7, "_note": "suggest: don't re-offer a seat for the same kind of task for N days after a no."},
     "limits": {"skip_above_percent": 90, "large_complexity_min": 3.0,
                "_note": "Before leasing a large job (Jev complexity >= large_complexity_min on 0-4, or best-of-two), skip a seat whose provider-reported usage is above skip_above_percent."},
 }
@@ -154,7 +165,7 @@ def worker_env(seat):
 
 
 # ---------- schema ----------
-STATUSES = ("queued", "leased", "running", "done", "failed", "needs_review", "blocked", "cached", "needs_model")
+STATUSES = ("queued", "leased", "running", "done", "failed", "needs_review", "blocked", "cached", "needs_model", "waiting_limit")
 JOBS_DDL = f"""CREATE TABLE IF NOT EXISTS jobs(
   id TEXT PRIMARY KEY, goal TEXT, constraints TEXT, done_when TEXT, kind TEXT,
   seat_id TEXT, status TEXT CHECK(status IN {STATUSES}),
@@ -170,7 +181,11 @@ JOB_COLS = {  # added columns (idempotent ALTERs)
     "best_of_two": "INTEGER DEFAULT 0", "parent_id": "TEXT", "bo2_role": "TEXT", "job_dir": "TEXT", "winner": "TEXT",
     "winner_reason": "TEXT", "complexity": "REAL", "search": "INTEGER DEFAULT 0",
     # v6: requested model not available -> status needs_model with a JSON note
-    "model_issue": "TEXT", "requested_model": "TEXT"}
+    "model_issue": "TEXT", "requested_model": "TEXT",
+    # v7: task chains (parent route='chain' + step jobs), limit fallback / waiting_limit
+    "chain": "INTEGER DEFAULT 0", "chain_id": "TEXT", "chain_step": "TEXT", "chain_note": "TEXT",
+    "wait_until": "REAL", "wait_source": "TEXT", "limit_notice": "TEXT", "notice_sent": "INTEGER DEFAULT 0",
+    "moves": "TEXT"}
 SCHEMA = JOBS_DDL + """;
 CREATE TABLE IF NOT EXISTS seats(
   id TEXT PRIMARY KEY, cli TEXT, home_dir TEXT, model TEXT,
@@ -219,7 +234,7 @@ def db():
     if "evidence" not in {r[1] for r in c.execute("PRAGMA table_info(decisions)")}:
         c.execute("ALTER TABLE decisions ADD COLUMN evidence TEXT")
     sql = c.execute("SELECT sql FROM sqlite_master WHERE name='jobs'").fetchone()[0]
-    if "needs_model" not in sql:  # widen the status CHECK: rebuild table once (v1 -> v2, v2.5 -> v2.6 needs_model)
+    if "waiting_limit" not in sql:  # widen the status CHECK: rebuild once (v1->v2, v2.6 needs_model, v2.7 waiting_limit)
         cols = ",".join(r[1] for r in c.execute("PRAGMA table_info(jobs)"))
         c.executescript(f"BEGIN; ALTER TABLE jobs RENAME TO jobs_v1; {JOBS_DDL}; COMMIT;")
         for col, typ in JOB_COLS.items(): c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
@@ -229,6 +244,7 @@ def db():
     if not c.execute("SELECT 1 FROM seats").fetchone():
         c.executemany("INSERT INTO seats(id,cli,home_dir,model,tier,enabled,auth,note,models) VALUES(?,?,?,?,?,?,?,?,?)", seeds())
     c.execute("INSERT OR REPLACE INTO meta VALUES('schema','2')")
+    c.execute("INSERT OR REPLACE INTO meta VALUES('schema_rev','v2.7')")
     c.commit()
     return c
 
